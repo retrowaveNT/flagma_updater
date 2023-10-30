@@ -1,0 +1,452 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import requests
+import json
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+from threading import Thread
+import time
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, NoSuchElementException
+from urllib.parse import urlsplit, urlunsplit, urljoin
+import threading
+import traceback
+import unicodedata
+
+
+class AccountManager(tk.Toplevel):
+    def __init__(self, parent):
+        tk.Toplevel.__init__(self)
+        self.wm_title("Управление аккаунтами")
+        self.parent = parent
+        self.accounts = self.parent.get_accounts()
+
+        self.account_name_var = tk.StringVar()
+        self.email_var = tk.StringVar()
+        self.password_var = tk.StringVar()
+
+        # Account Name Entry
+        self.account_name_label = tk.Label(self, text="Название аккаунта:")
+        self.account_name_entry = tk.Entry(self, textvariable=self.account_name_var, width=40)
+
+        # Email Entry
+        self.email_label = tk.Label(self, text="Почта:")
+        self.email_entry = tk.Entry(self, textvariable=self.email_var, width=40)
+
+        # Password Entry
+        self.password_label = tk.Label(self, text="Пароль:")
+        self.password_entry = tk.Entry(self, textvariable=self.password_var, show="*", width=40)
+
+        # Buttons
+        self.add_button = tk.Button(self, text="Добавить аккаунт", command=self.add_account, width=20)
+        self.remove_button = tk.Button(self, text="Удалить аккаунт", command=self.confirm_remove_account, width=20)
+
+        # Account List
+        self.account_list_label = tk.Label(self, text="Аккаунты:")
+        self.account_listbox = tk.Listbox(self, selectmode=tk.SINGLE, width=40, height=10)
+        self.account_listbox.bind('<Double-Button-1>', self.load_account_data)
+
+        # Packing
+        self.account_name_label.grid(row=0, column=0, sticky=tk.E)
+        self.account_name_entry.grid(row=0, column=1, padx=10, pady=10)
+        self.email_label.grid(row=1, column=0, sticky=tk.E)
+        self.email_entry.grid(row=1, column=1, padx=10, pady=10)
+        self.password_label.grid(row=2, column=0, sticky=tk.E)
+        self.password_entry.grid(row=2, column=1, padx=10, pady=10)
+        self.add_button.grid(row=3, column=0, columnspan=2, pady=10)
+        self.remove_button.grid(row=4, column=0, columnspan=2, pady=10)
+        self.account_list_label.grid(row=5, column=0, columnspan=2, sticky=tk.W)
+        self.account_listbox.grid(row=6, column=0, columnspan=2, padx=10, pady=10)
+
+        self.load_existing_accounts()
+
+        # Set the size of the window
+        self.geometry('400x450')
+
+    def load_existing_accounts(self):
+        self.account_listbox.delete(0, tk.END)  # Очищаем список перед добавлением аккаунтов
+        for account in self.accounts:
+            status_indicator = "✅" if account.get("has_message_ids", False) else "❌"
+            self.account_listbox.insert(tk.END, f"{account['name']} ({status_indicator})")
+
+    def add_account(self):
+        account_name = self.account_name_var.get()
+        account_email = self.email_var.get()
+        account_password = self.password_var.get()
+
+        if account_name and account_email and account_password:
+            new_account = {
+                "name": account_name.replace("\n", ""),
+                "login": account_email.replace("\n", ""),
+                "password": account_password.replace("\n", ""),
+                "message_ids": [],
+                "has_message_ids": False
+            }
+            self.parent.add_account(new_account)
+            self.parent.save_data()  # Сохраняем данные после добавления аккаунта
+            self.load_existing_accounts()  # После добавления аккаунта обновляем список аккаунтов
+            self.clear_entry_fields()
+
+    def clear_entry_fields(self):
+        self.account_name_var.set('')
+        self.email_var.set('')
+        self.password_var.set('')
+
+    def confirm_remove_account(self):
+        selected_account_index = self.account_listbox.curselection()
+        if selected_account_index:
+            selected_account_text = self.account_listbox.get(selected_account_index[0])
+            account_name = selected_account_text.split(" (")[0]  # Извлекаем имя аккаунта из текста
+            confirmation = messagebox.askyesno("Подтверждение", "Вы уверены, что хотите удалить аккаунт?")
+            if confirmation:
+                self.remove_account(account_name)  # Передаем только имя аккаунта при удалении
+
+    def remove_account(self, account_name):
+        for account in self.accounts:
+            if account["name"] == account_name:
+                self.accounts.remove(account)
+                self.parent.save_data()  # Сохраняем данные после удаления аккаунта
+                self.load_existing_accounts()  # После удаления аккаунта обновляем список аккаунтов
+                return
+
+    def load_account_data(self, event):
+        selected_account_index = self.account_listbox.curselection()
+        if selected_account_index:
+            selected_account_name = self.account_listbox.get(selected_account_index[0])
+            selected_account = self.parent.get_account_info(selected_account_name)
+            if selected_account:
+                self.account_name_var.set(selected_account.get("name", ""))
+                self.email_var.set(selected_account.get("login", ""))
+                self.password_var.set(selected_account.get("password", ""))
+            else:
+                self.clear_entry_fields()
+        else:
+            self.clear_entry_fields()
+
+class App(tk.Tk):
+    def __init__(self):
+        tk.Tk.__init__(self)
+        self.wm_title("Актуализация Flagma")
+        self.accounts = []  # Инициализация списка аккаунтов
+        self.all_message_ids = []  # Инициализация списка для всех ID товаров
+        self.load_data()  # Загрузка данных из файла
+
+        self.label = tk.Label(self, text="Выберите аккаунт:")
+        self.label.pack()
+
+        self.account_selector = ttk.Combobox(self)
+        self.account_selector.configure(width=50)
+        self.account_selector.pack(pady=10)
+
+        self.update_account_selector()
+
+        self.update_id_button = tk.Button(self, text="Обновить ID товаров", command=self.start_id_update_thread)
+        self.update_id_button.configure(height=2, width=20)
+        self.update_id_button.pack(pady=10)
+
+        self.s_post_button = tk.Button(self, text="Актуализировать", command=self.start_post_request_thread)
+        self.s_post_button.configure(height=2, width=20)
+        self.s_post_button.pack(pady=10)
+
+        self.manage_accounts_button = tk.Button(self, text="Управление аккаунтами", command=self.open_account_manager)
+        self.manage_accounts_button.configure(height=2, width=20)
+        self.manage_accounts_button.pack(pady=10)
+
+        self.geometry('400x300')
+        self.show_dialog("При первой попытке актуализации, обязательно обновите список ID товаров")
+        self.driver = None
+        self.base_url = None
+        self.all_message_ids = []  # Инициализируем список для всех ID товаров
+
+        self.account_selector.set(self.accounts[0]["name"] if self.accounts else "")  # Устанавливаем первый аккаунт по умолчанию
+
+    def open_account_manager(self):
+        account_manager = AccountManager(self)
+        account_manager.grab_set()
+
+    def update_account_selector(self):
+        account_names = [account["name"] for account in self.accounts]
+        self.account_selector['values'] = account_names
+
+        def on_account_select(event):
+            selected_account_name = self.account_selector.get()
+            if selected_account_name:
+                self.account_info = self.get_account_info(selected_account_name)
+                if self.account_info and self.account_info.get("has_message_ids", False):
+                    self.wm_title(f"Актуализация Flagma - {selected_account_name} (✅)")
+                else:
+                    self.wm_title(f"Актуализация Flagma - {selected_account_name} (❌)")
+                    confirmation = messagebox.askyesno("Подтверждение", "У аккаунта нет сохраненных ID товаров. Хотите начать процесс сбора ID товаров?")
+                    if confirmation:
+                        self.start_id_update_thread()
+            else:
+                self.account_info = None
+                self.wm_title("Актуализация Flagma")
+
+        self.account_selector.bind("<<ComboboxSelected>>", on_account_select)
+
+    def add_account(self, new_account):
+        new_account["has_message_ids"] = False  # Устанавливаем has_message_ids в False для нового аккаунта
+        self.accounts.append(new_account)
+        self.save_data()
+        self.update_account_selector()
+
+    def remove_account(self, account_name):
+        for account in self.accounts:
+            if account["name"] == account_name:
+                self.accounts.remove(account)
+                self.save_data()
+                self.update_account_selector()
+                return
+    def start_post_update_process(self):
+        confirmation = messagebox.askyesno("Подтверждение", "ID товаров успешно обновлены. Хотите запустить процесс актуализации товаров?")
+        if confirmation:
+            self.start_post_request_thread()
+
+    def start_id_update_thread(self):
+        selected_account_name = self.account_selector.get()
+        if selected_account_name:
+            selected_account = self.get_account_info(selected_account_name)
+            if selected_account:
+                confirmation_message = ""
+                if selected_account["has_message_ids"]:
+                    confirmation_message = "У аккаунта уже есть сохраненные ID товаров. Хотите перезаписать их новыми ID?"
+                else:
+                    confirmation_message = "У аккаунта нет сохраненных ID товаров. Хотите начать процесс сбора ID товаров?"
+
+                if self.all_message_ids:  
+                    selected_account["message_ids"] = self.all_message_ids
+                    selected_account["has_message_ids"] = True  
+                    selected_account["update_ids"] = False  
+                    self.save_data()  
+                    self.show_dialog("ID товаров успешно обновлены.")
+                    self.update_account_selector()  
+                    self.start_post_update_process()  
+                else:
+                    confirmation = messagebox.askyesno("Подтверждение", confirmation_message)
+                    if confirmation:
+                        selected_account["message_ids"] = []
+                        self.all_message_ids = self.run_selenium_for_update(selected_account['login'], selected_account['password'])
+                        if self.all_message_ids:
+                            selected_account["message_ids"] = self.all_message_ids
+                            selected_account["has_message_ids"] = True  
+                            selected_account["update_ids"] = False  
+                            self.save_data()  
+                            self.show_dialog("ID товаров успешно обновлены.")
+                            self.update_account_selector()  
+                            self.start_post_update_process()  
+                        else:
+                            self.show_dialog("Не удалось обновить ID товаров.")
+            else:
+                self.show_dialog("Выберите аккаунт для обновления ID товаров.")
+        else:
+            self.show_dialog("Выберите аккаунт для обновления ID товаров.")
+
+    def run_selenium_for_update(self, username, password):
+        try:
+            self.driver = webdriver.Chrome()
+
+            # Вход на сайт
+            self.driver.get('https://flagma.com/ru/login')
+            email_field = WebDriverWait(self.driver, 100).until(EC.presence_of_element_located((By.ID, "LoginForm_username")))
+            email_field.clear()
+            email_field.send_keys(username)
+            password_field = WebDriverWait(self.driver, 100).until(EC.presence_of_element_located((By.ID, "LoginForm_password")))
+            password_field.clear()
+            password_field.send_keys(password)
+            login_button = WebDriverWait(self.driver, 100).until(EC.element_to_be_clickable((By.ID, "login_button_main")))
+            login_button.click()
+
+            # Ожидаем ввода капчи (URL изменится после успешного входа)
+            WebDriverWait(self.driver, 100).until(EC.url_changes("https://flagma.com/ru/login"))
+
+            # Получаем базовый URL для объявлений
+            self.base_url = self.driver.execute_script("""
+                const userMenu = document.querySelector('.user-menu');
+                const links = userMenu.querySelectorAll('a');
+                let base_url = null;
+
+                links.forEach((link) => {
+                    if (link.innerText === 'Объявления') {
+                        base_url = link.getAttribute('href');
+                    }
+                });
+
+                return base_url;
+            """)
+
+            # Здесь добавлен код для получения message_ids
+            self.driver.get(self.base_url)
+            self.all_message_ids = []  # Создаем пустой список для накопления всех IDs
+
+            while True:
+                items = WebDriverWait(self.driver, 10).until(EC.presence_of_all_elements_located((By.CLASS_NAME, "item-checkbox")))
+                message_ids = [item.get_attribute('value') for item in items]
+                self.all_message_ids.extend(message_ids)
+
+                try:
+                    # Используем JavaScript для нажатия кнопки "Следующая страница"
+                    next_button = self.driver.find_element(By.CSS_SELECTOR, 'li.next a')
+                    if next_button.is_enabled():
+                        self.driver.execute_script("arguments[0].click();", next_button)
+                    else:
+                        print("Достигнут конец страниц. Завершаем сбор ID товаров.")
+                        break
+                except Exception as e:
+                    print("Произошла ошибка при нажатии кнопки 'Следующая страница':", e)
+                    break
+
+                # Ждем загрузки следующей страницы и появления товаров
+                WebDriverWait(self.driver, 10).until(EC.presence_of_all_elements_located((By.CLASS_NAME, "item-checkbox")))
+
+            # После получения всех message_ids
+            return self.all_message_ids
+        except Exception as e:
+            print(f"Произошла ошибка: {e}")
+        finally:
+            if self.driver:
+                self.driver.quit()
+
+    def start_post_request_thread(self):
+        selected_account_name = self.account_selector.get().lower()  
+        if selected_account_name:
+            selected_account = self.get_account_info(selected_account_name)
+            if selected_account and "message_ids" in selected_account and selected_account["message_ids"]:
+                thread = threading.Thread(target=self.run_selenium_and_post, args=(selected_account['login'], selected_account['password'], selected_account["message_ids"]))
+                thread.start()
+            else:
+                self.show_dialog("Выберите корректный аккаунт.")
+        else:
+            self.show_dialog("Выберите аккаунт для актуализации.")
+
+    def run_selenium_and_post(self, username, password, message_ids):
+        try:
+            self.driver = webdriver.Chrome()
+
+            # Вход на сайт
+            self.driver.get('https://flagma.com/ru/login')
+            email_field = WebDriverWait(self.driver, 100).until(EC.presence_of_element_located((By.ID, "LoginForm_username")))
+            email_field.clear()
+            email_field.send_keys(username)
+            password_field = WebDriverWait(self.driver, 100).until(EC.presence_of_element_located((By.ID, "LoginForm_password")))
+            password_field.clear()
+            password_field.send_keys(password)
+            login_button = WebDriverWait(self.driver, 100).until(EC.element_to_be_clickable((By.ID, "login_button_main")))
+            login_button.click()
+
+            # Ожидаем ввода капчи (URL изменится после успешного входа)
+            WebDriverWait(self.driver, 100).until(EC.url_changes("https://flagma.com/ru/login"))
+
+            # Получаем базовый URL для объявлений
+            self.base_url = self.driver.execute_script("""
+                const userMenu = document.querySelector('.user-menu');
+                const links = userMenu.querySelectorAll('a');
+                let base_url = null;
+
+                links.forEach((link) => {
+                    if (link.innerText === 'Объявления') {
+                        base_url = link.getAttribute('href');
+                    }
+                });
+
+                return base_url;
+            """)
+            print(self.base_url)
+
+            # Отправка POST-запроса с обновленными message_ids
+            cookies = self.driver.get_cookies()
+            s = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+
+            for cookie in cookies:
+                s.cookies.set(cookie['name'], cookie['value'])
+                
+            origin_url = urlsplit(self.base_url)
+            origin = f"{origin_url.scheme}://{origin_url.netloc}"
+
+            # Формирование URL для запроса на основе self.base_url
+            update_url = urljoin(self.base_url, "/ru/index.php?r=message/updatemessages")
+
+            headers = {
+                "Origin": origin,
+                "Referer": self.base_url,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            
+            # Отправка POST-запроса с обновленными message_ids
+            payload = {'return_count_updated': '1', 'message_id[]': message_ids}
+            response = s.post(update_url, data=payload, headers=headers)
+
+            # Проверка успешности запроса
+            if response.status_code == 200:
+                response_content = json.loads(response.content.decode('utf-8'))
+                count_updated = response_content.get('count_updated', 'Unknown')
+
+                # Получение названия выбранной компании
+                selected_account_name = self.account_selector.get()
+
+                # Вывод уведомления
+                self.show_dialog(f"{selected_account_name} - Готово! Товаров обновлено: {count_updated}")
+
+            else:
+                self.show_dialog(f"Ошибка при отправке POST-запроса. Код состояния: {response.status_code}")
+
+        except Exception as e:
+            print(f"Произошла ошибка при отправке POST-запроса: {e}")
+            traceback.print_exc()
+            self.show_dialog("Произошла ошибка при актуализации товаров.")
+        finally:
+            if self.driver:
+                self.driver.quit()
+
+    def show_dialog(self, message):
+        messagebox.showinfo("Info", message)
+
+    def save_data(self):
+        try:
+            with open("flagma-data.json", "w") as json_file:
+                json.dump(self.accounts, json_file, indent=4)  # Сохраняем список аккаунтов в файл
+            print("Данные успешно сохранены в файл.")
+        except Exception as e:
+            print(f"Ошибка при сохранении данных в файл: {e}")
+
+    def load_data(self):
+        try:
+            with open("flagma-data.json", "r") as json_file:
+                self.accounts = json.load(json_file)
+            print("Loaded Accounts:", self.accounts)  # Add this line for debugging
+        except FileNotFoundError:
+            self.accounts = []
+            print("File not found. Created a new file for saving data.")
+        except json.JSONDecodeError:
+            print("Error decoding JSON. File is corrupted.")
+        except Exception as e:
+            print(f"Error reading file: {e}")
+
+    def get_accounts(self):
+        return self.accounts
+
+    def get_account_info(self, username):
+        normalized_username = unicodedata.normalize("NFKD", username).encode("ascii", "ignore").decode("utf-8")
+        for account in self.accounts:
+            normalized_account_name = unicodedata.normalize("NFKD", account["name"]).encode("ascii", "ignore").decode("utf-8")
+            if normalized_account_name == normalized_username:
+                return account
+        return None
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
